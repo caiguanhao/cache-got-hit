@@ -1,0 +1,155 @@
+*** -	2016-04-25 01:01:13.000000000 +0800
+--- src/http/modules/ngx_http_memcached_module.c	2016-04-25 01:01:07.000000000 +0800
+***************
+*** 164,169 ****
+--- 164,175 ----
+  #define NGX_HTTP_MEMCACHED_END   (sizeof(ngx_http_memcached_end) - 1)
+  static u_char  ngx_http_memcached_end[] = CRLF "END" CRLF;
+  
++ #define CACHE_GOT_HIT_HEADERS_INCLUDED   (sizeof(cache_got_hit_headers_included) - 1)
++ static u_char  cache_got_hit_headers_included[] = "-----CACHE GOT HIT HEADERS INCLUDED-----" CRLF;
++ 
++ #define CACHE_GOT_HIT_STATUS   (sizeof(cache_got_hit_status) - 1)
++ static u_char  cache_got_hit_status[] = "Cache-Got-Hit-Status";
++ 
+  
+  static ngx_int_t
+  ngx_http_memcached_handler(ngx_http_request_t *r)
+***************
+*** 252,257 ****
+--- 258,270 ----
+  
+      len = sizeof("get ") - 1 + vv->len + escape + sizeof(CRLF) - 1;
+  
++     ngx_table_elt_t *if_none_match = r->headers_in.if_none_match;
++     uintptr_t if_none_match_escape = 0;
++     if (if_none_match != NULL) {
++         if_none_match_escape = 2 * ngx_escape_uri(NULL, if_none_match->value.data, if_none_match->value.len, NGX_ESCAPE_MEMCACHED);
++         len += 1 + if_none_match->value.len + if_none_match_escape;
++     }
++ 
+      b = ngx_create_temp_buf(r->pool, len);
+      if (b == NULL) {
+          return NGX_ERROR;
+***************
+*** 283,288 ****
+--- 296,312 ----
+  
+      ctx->key.len = b->last - ctx->key.data;
+  
++     if (if_none_match != NULL) {
++         *b->last++ = ' ';
++         if (if_none_match_escape == 0) {
++             b->last = ngx_copy(b->last, if_none_match->value.data, if_none_match->value.len);
++ 
++         } else {
++             b->last = (u_char *) ngx_escape_uri(b->last, if_none_match->value.data, if_none_match->value.len,
++                                                 NGX_ESCAPE_MEMCACHED);
++         }
++     }
++ 
+      ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                     "http memcached request: \"%V\"", &ctx->key);
+  
+***************
+*** 417,422 ****
+--- 441,526 ----
+          u->state->status = 200;
+          u->buffer.pos = p + sizeof(CRLF) - 1;
+  
++         if (u->buffer.pos + CACHE_GOT_HIT_HEADERS_INCLUDED <= u->buffer.last &&
++             ngx_strncmp(u->buffer.pos, cache_got_hit_headers_included, CACHE_GOT_HIT_HEADERS_INCLUDED) == 0) {
++             u->buffer.pos += CACHE_GOT_HIT_HEADERS_INCLUDED;
++             u->headers_in.content_length_n -= CACHE_GOT_HIT_HEADERS_INCLUDED;
++             if (u->headers_in.content_length_n == 0) {
++                 return NGX_HTTP_UPSTREAM_INVALID_HEADER;
++             }
++             ngx_int_t rc;
++             ngx_int_t status;
++             ngx_table_elt_t *h;
++             ngx_http_upstream_header_t *hh;
++             ngx_http_upstream_main_conf_t *umcf = ngx_http_get_module_main_conf(r, ngx_http_upstream_module);
++             while (1) {
++                 p = u->buffer.pos;
++                 rc = ngx_http_parse_header_line(r, &r->upstream->buffer, 1);
++                 if (rc == NGX_OK) {
++                     if (r->header_name_end - r->header_name_start == CACHE_GOT_HIT_STATUS &&
++                         ngx_strncmp(r->header_name_start, cache_got_hit_status, CACHE_GOT_HIT_STATUS) == 0) {
++                         status = ngx_atoof(r->header_start, r->header_end - r->header_start);
++                         if (status >= 100) {
++                             u->headers_in.status_n = status;
++                             u->state->status = status;
++                         }
++                         u->headers_in.content_length_n -= u->buffer.pos - p;
++                         continue;
++                     }
++                     h = ngx_list_push(&r->upstream->headers_in.headers);
++                     if (h == NULL) {
++                         return NGX_ERROR;
++                     }
++                     h->hash = r->header_hash;
++                     h->key.len = r->header_name_end - r->header_name_start;
++                     h->value.len = r->header_end - r->header_start;
++                     h->key.data = ngx_pnalloc(r->pool,
++                             h->key.len + 1 + h->value.len + 1 + h->key.len);
++                     if (h->key.data == NULL) {
++                         return NGX_ERROR;
++                     }
++                     h->value.data = h->key.data + h->key.len + 1;
++                     h->lowcase_key = h->key.data + h->key.len + 1 + h->value.len + 1;
++ 
++                     ngx_cpystrn(h->key.data, r->header_name_start, h->key.len + 1);
++                     ngx_cpystrn(h->value.data, r->header_start, h->value.len + 1);
++ 
++                     if (h->key.len == r->lowcase_index) {
++                         ngx_memcpy(h->lowcase_key, r->lowcase_header, h->key.len);
++                     } else {
++                         ngx_strlow(h->lowcase_key, h->key.data, h->key.len);
++                     }
++ 
++                     hh = ngx_hash_find(&umcf->headers_in_hash, h->hash,
++                             h->lowcase_key, h->key.len);
++ 
++                     if (hh && hh->handler(r, h, hh->offset) != NGX_OK) {
++                         return NGX_ERROR;
++                     }
++ 
++                     u->headers_in.content_length_n -= u->buffer.pos - p;
++ 
++                     continue;
++                 }
++ 
++                 if (rc == NGX_HTTP_PARSE_HEADER_DONE) {
++                     if (ngx_http_set_content_type(r) != NGX_OK) {
++                         return NGX_HTTP_INTERNAL_SERVER_ERROR;
++                     }
++                     u->headers_in.content_length_n -= 2;
++                     return NGX_OK;
++                 }
++ 
++                 return NGX_HTTP_UPSTREAM_INVALID_HEADER;
++             }
++         }
++ 
++         if (ngx_http_set_content_type(r) != NGX_OK) {
++             return NGX_HTTP_INTERNAL_SERVER_ERROR;
++         }
++ 
++         u->keepalive = 1;
++ 
+          return NGX_OK;
+      }
+  
+***************
+*** 666,671 ****
+--- 770,779 ----
+                                         |NGX_HTTP_UPSTREAM_FT_OFF;
+      }
+  
++     // important, necessary for ngx_http_upstream_process_headers
++     conf->upstream.hide_headers_hash.buckets = ngx_pcalloc(cf->pool, sizeof(ngx_hash_elt_t *));
++     conf->upstream.hide_headers_hash.size = 1;
++ 
+      if (conf->upstream.upstream == NULL) {
+          conf->upstream.upstream = prev->upstream.upstream;
+      }
